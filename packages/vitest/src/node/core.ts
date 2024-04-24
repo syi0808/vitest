@@ -1,4 +1,5 @@
 import { existsSync, promises as fs } from 'node:fs'
+import type { Writable } from 'node:stream'
 import { isMainThread } from 'node:worker_threads'
 import type { ViteDevServer } from 'vite'
 import { mergeConfig } from 'vite'
@@ -31,6 +32,9 @@ const WATCHER_DEBOUNCE = 100
 
 export interface VitestOptions {
   packageInstaller?: VitestPackageInstaller
+  stdin?: NodeJS.ReadStream
+  stdout?: NodeJS.WriteStream | Writable
+  stderr?: NodeJS.WriteStream | Writable
 }
 
 export class Vitest {
@@ -74,7 +78,7 @@ export class Vitest {
     public readonly mode: VitestRunMode,
     options: VitestOptions = {},
   ) {
-    this.logger = new Logger(this)
+    this.logger = new Logger(this, options.stdout, options.stderr)
     this.packageInstaller = options.packageInstaller || new VitestPackageInstaller()
   }
 
@@ -93,7 +97,7 @@ export class Vitest {
     this.runningPromise = undefined
     this.projectsTestFiles.clear()
 
-    const resolved = resolveConfig(this.mode, options, server.config)
+    const resolved = resolveConfig(this.mode, options, server.config, this.logger)
 
     this.server = server
     this.config = resolved
@@ -315,23 +319,22 @@ export class Vitest {
 
     const cwd = process.cwd()
 
-    const projects: (() => Promise<WorkspaceProject>)[] = []
+    const projects: WorkspaceProject[] = []
 
     try {
       // we have to resolve them one by one because CWD should depend on the project
       for (const filepath of filteredWorkspaces) {
         if (this.server.config.configFile === filepath) {
           const project = await this.createCoreProject()
-          projects.push(() => Promise.resolve(project))
+          projects.push(project)
           continue
         }
         const dir = filepath.endsWith('/') ? filepath.slice(0, -1) : dirname(filepath)
         if (isMainThread)
           process.chdir(dir)
-        // this just resolves the config, later we also wait when the server is resolved,
-        // but we can do that in parallel because it doesn't depend on process.cwd()
-        // this is strictly a performance optimization so we don't need to wait for server to start
-        projects.push(await initializeProject(filepath, this, { workspaceConfigPath, test: cliOverrides }))
+        projects.push(
+          await initializeProject(filepath, this, { workspaceConfigPath, test: cliOverrides }),
+        )
       }
     }
     finally {
@@ -339,7 +342,7 @@ export class Vitest {
         process.chdir(cwd)
     }
 
-    const projectPromises: Promise<() => Promise<WorkspaceProject>>[] = []
+    const projectPromises: Promise<WorkspaceProject>[] = []
 
     projectsOptions.forEach((options, index) => {
       // we can resolve these in parallel because process.cwd() is not changed
@@ -349,14 +352,10 @@ export class Vitest {
     if (!projects.length && !projectPromises.length)
       return [await this.createCoreProject()]
 
-    const resolvedProjectsReceivers = [
+    const resolvedProjects = await Promise.all([
       ...projects,
       ...await Promise.all(projectPromises),
-    ]
-    // we need to wait when the server is resolved, we can do that in parallel
-    const resolvedProjects = await Promise.all(
-      resolvedProjectsReceivers.map(receiver => receiver()),
-    )
+    ])
     const names = new Set<string>()
 
     for (const project of resolvedProjects) {
